@@ -262,11 +262,45 @@ def get_current_price(ticker):
     print(f"Could not get price for {ticker} from any source")
     return None
 
+def validate_ticker(ticker):
+    """Check ticker exists in T212's instruments list. Return True/False."""
+    base_url = f"https://{T212_ENV}.trading212.com/api/v0"
+    headers  = t212_headers()
+    try:
+        resp = requests.get(
+            f"{base_url}/equity/metadata/instruments",
+            headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        valid_tickers = [inst.get("ticker") for inst in resp.json()]
+        if ticker in valid_tickers:
+            print(f"✅ Ticker validated: {ticker}")
+            return True
+        else:
+            # Try to find close matches to help with debugging
+            base = ticker.split("_")[0]
+            matches = [t for t in valid_tickers if t.startswith(base)]
+            print(f"❌ Ticker not found: {ticker}")
+            print(f"   Similar tickers in T212: {matches[:5]}")
+            return False
+    except requests.RequestException as e:
+        print(f"Ticker validation error: {e}")
+        return False
+
+
 def execute_trade(ticker, action, amount_gbp):
     """Place a market order on Trading 212."""
     base_url = f"https://{T212_ENV}.trading212.com/api/v0"
     headers  = t212_headers()
     headers["Content-Type"] = "application/json"
+
+    # Validate ticker exists in T212 before attempting order
+    if not validate_ticker(ticker):
+        send_whatsapp(
+            f"⚠️ Trade aborted: {ticker} not found in Trading 212.\n"
+            f"Claude may have used the wrong ticker format. No money moved."
+        )
+        return False
 
     try:
         if action == "BUY":
