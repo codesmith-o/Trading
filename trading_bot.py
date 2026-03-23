@@ -119,9 +119,16 @@ def get_instrument_details(ticker):
         return None
 
 def get_current_price(ticker):
-    """Fetch the current price of a ticker from the portfolio or instruments endpoint."""
+    """
+    Fetch current price for a ticker.
+    1. Check existing T212 portfolio positions first (fastest)
+    2. Fall back to Yahoo Finance for stocks not yet held
+    T212 ticker format is like AAPL_US_EQ — Yahoo uses AAPL
+    """
     base_url = f"https://{T212_ENV}.trading212.com/api/v0"
     headers  = t212_headers()
+
+    # Step 1 — check T212 portfolio for current price
     try:
         resp = requests.get(
             f"{base_url}/equity/portfolio",
@@ -130,20 +137,36 @@ def get_current_price(ticker):
         resp.raise_for_status()
         for pos in resp.json():
             if pos.get("ticker") == ticker:
-                return pos.get("currentPrice", 0)
-        # Not in portfolio — fetch from instruments list
-        resp2 = requests.get(
-            f"{base_url}/equity/metadata/instruments",
-            headers=headers, timeout=10
-        )
-        resp2.raise_for_status()
-        for inst in resp2.json():
-            if inst.get("ticker") == ticker:
-                return inst.get("currentPrice", 0)
-        return None
+                price = pos.get("currentPrice", 0)
+                if price and price > 0:
+                    print(f"Price from T212 portfolio: {ticker} = {price}")
+                    return price
     except requests.RequestException as e:
-        print(f"Price fetch error: {e}")
-        return None
+        print(f"T212 portfolio price fetch error: {e}")
+
+    # Step 2 — fall back to Yahoo Finance
+    # Convert T212 format (XOM_US_EQ) to Yahoo format (XOM)
+    yahoo_ticker = ticker.split("_")[0]
+
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_ticker}"
+        headers_yf = {
+            "User-Agent": "Mozilla/5.0"
+        }
+        resp = requests.get(url, headers=headers_yf, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        price = (
+            data["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        )
+        if price and price > 0:
+            print(f"Price from Yahoo Finance: {yahoo_ticker} = {price}")
+            return price
+    except Exception as e:
+        print(f"Yahoo Finance price fetch error: {e}")
+
+    print(f"Could not get price for {ticker} from any source")
+    return None
 
 def execute_trade(ticker, action, amount_gbp):
     """Place a market order on Trading 212."""
