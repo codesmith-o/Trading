@@ -340,7 +340,69 @@ def run_trading_check():
         send_whatsapp(f"🤖 TRADING BRAIN — {timestamp}\n\n{analysis}")
         return
 
-    # 5. Set pending trade and notify via WhatsApp
+    # 5. Work out funding source for BUY orders
+    funding_line = ""
+    if action == "BUY" and summary:
+        available_cash = summary.get("cash", {}).get("availableToTrade", 0)
+
+        if available_cash >= amount:
+            # Enough cash — simple case
+            funding_line = (
+                f"💵 FUNDED FROM: Cash balance "
+                f"(£{available_cash:.2f} available)"
+            )
+        else:
+            # Not enough cash — show what would need selling
+            shortfall = amount - available_cash
+            funding_line = (
+                f"💵 FUNDED FROM: £{available_cash:.2f} cash"
+            )
+            if positions:
+                # Find the smallest position that covers the shortfall
+                candidates = [
+                    p for p in positions
+                    if p.get("currentPrice", 0) * p.get("quantity", 0) >= shortfall
+                ]
+                if candidates:
+                    # Pick the one closest in value to the shortfall
+                    best = min(
+                        candidates,
+                        key=lambda p: abs(
+                            p.get("currentPrice", 0) * p.get("quantity", 0) - shortfall
+                        )
+                    )
+                    pos_value = best.get("currentPrice", 0) * best.get("quantity", 0)
+                    funding_line += (
+                        f" + selling {best.get('ticker')} "
+                        f"(worth ~£{pos_value:.2f})\n"
+                        f"⚠️ Note: {best.get('ticker')} will be sold first "
+                        f"to cover the shortfall of £{shortfall:.2f}"
+                    )
+                else:
+                    funding_line += (
+                        f"\n⚠️ Warning: Only £{available_cash:.2f} available — "
+                        f"insufficient funds for this trade"
+                    )
+
+    elif action == "SELL":
+        # Show what we're selling and its current value
+        if positions:
+            for pos in positions:
+                if pos.get("ticker") == ticker:
+                    pos_value = pos.get("currentPrice", 0) * pos.get("quantity", 0)
+                    pnl       = pos.get("ppl", 0)
+                    pnl_pct   = (
+                        (pos.get("currentPrice", 0) - pos.get("averagePrice", 0))
+                        / pos.get("averagePrice", 0) * 100
+                    ) if pos.get("averagePrice", 0) else 0
+                    funding_line = (
+                        f"💵 SELLING: {ticker} "
+                        f"(current value £{pos_value:.2f} | "
+                        f"P&L £{pnl:.2f} / {pnl_pct:+.1f}%)"
+                    )
+                    break
+
+    # 6. Set pending trade and notify via WhatsApp
     pending_trade = {
         "active":    True,
         "ticker":    ticker,
@@ -353,6 +415,7 @@ def run_trading_check():
     message = (
         f"🤖 TRADING BRAIN — {timestamp}\n\n"
         f"{analysis}\n\n"
+        f"{funding_line}\n\n"
         f"⏳ I will {action} £{amount:.0f} of {ticker} in 15 mins.\n"
         f"Reply *CANCEL* to stop this trade."
     )
