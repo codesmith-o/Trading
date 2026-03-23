@@ -32,6 +32,18 @@ T212_ENV           = os.environ.get("T212_ENV", "live")
 MAX_TRADE_AMOUNT   = 100  # Hard cap £100 per trade
 CANCEL_WINDOW_SECS = 60  # 1 minute
 
+# ── Protected Holdings ─────────────────────────────────────────────────────────
+# The bot will NEVER auto-sell these positions to fund other trades.
+# Add any long-term holds, ETFs, or investment trusts here.
+PROTECTED_TICKERS = [
+    "SEITl_EQ",   # SDCL Efficiency Income Trust (LSE)
+    "SEIT_EQ",    # alternate format just in case
+]
+
+# Also protect anything that looks like an LSE-listed instrument
+# (doesn't contain _US_EQ) — add False here to disable this rule
+AUTO_PROTECT_NON_US = True
+
 # ── State ─────────────────────────────────────────────────────────────────────
 # Stores the pending trade while we wait for possible cancellation
 
@@ -262,30 +274,46 @@ def get_current_price(ticker):
     print(f"Could not get price for {ticker} from any source")
     return None
 
+def is_protected(ticker):
+    """Return True if this ticker should never be auto-sold."""
+    if ticker in PROTECTED_TICKERS:
+        print(f"🛡️ {ticker} is explicitly protected — skipping")
+        return True
+    if AUTO_PROTECT_NON_US and "_US_EQ" not in ticker:
+        print(f"🛡️ {ticker} is non-US instrument — auto-protected")
+        return True
+    return False
+
+
 def pick_position_to_sell(positions, amount_needed):
     """
     Pick the best existing position to sell to raise cash.
-    Prefers positions that:
-    - Cover the amount needed
-    - Have the lowest conviction (smallest value or most negative P&L)
+    Respects protected holdings — never sells ETFs, trusts, or LSE stocks.
+    Prefers the worst performing position that covers the amount needed.
     Returns the position dict or None.
     """
     if not positions:
         return None
 
-    # Exclude positions already being bought in this cycle
     candidates = []
     for pos in positions:
+        ticker = pos.get("ticker", "")
+
+        # Skip protected holdings
+        if is_protected(ticker):
+            continue
+
         value = pos.get("currentPrice", 0) * pos.get("quantity", 0)
         pnl   = pos.get("ppl", 0)
         candidates.append({
-            "ticker":   pos.get("ticker"),
+            "ticker":   ticker,
             "value":    value,
             "pnl":      pnl,
             "quantity": pos.get("quantity", 0)
         })
 
     if not candidates:
+        print("No eligible positions to sell — all are protected")
         return None
 
     # Sort by P&L ascending — sell worst performer first
@@ -294,9 +322,9 @@ def pick_position_to_sell(positions, amount_needed):
     # Prefer one that covers the amount needed
     covering = [c for c in candidates if c["value"] >= amount_needed]
     if covering:
-        return covering[0]  # worst performer that covers the cost
+        return covering[0]
 
-    # If none cover it fully, return the largest position
+    # If none cover it fully, return the largest unprotected position
     candidates.sort(key=lambda x: x["value"], reverse=True)
     return candidates[0]
 
@@ -369,9 +397,10 @@ def execute_trade(ticker, action, amount_gbp):
                         print(f"Auto-selling {sell_ticker} (£{sell_value:.2f}) to fund buy")
 
                         # Execute the sell first
+                        # Use exact quantity from portfolio — no rounding on sells
                         sell_payload = {
                             "ticker":   sell_ticker,
-                            "quantity": round(-abs(sell_quantity), 4)
+                            "quantity": -abs(sell_quantity)
                         }
                         sell_resp = requests.post(
                             f"https://{T212_ENV}.trading212.com/api/v0/equity/orders/market",
@@ -436,9 +465,10 @@ def execute_trade(ticker, action, amount_gbp):
                 print(f"No position found for {ticker} to sell")
                 return False
 
+            # Use exact quantity from portfolio — no rounding on sells
             payload = {
                 "ticker":   ticker,
-                "quantity": -abs(quantity)  # negative = sell
+                "quantity": -abs(quantity)
             }
 
         resp = requests.post(
