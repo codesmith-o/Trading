@@ -182,7 +182,7 @@ unusual momentum or catalysts in the last 24 hours.
         # Extract the text response (may include tool use blocks)
         full_response = " ".join(
             block.text for block in response.content 
-            if hasattr(block, "text")
+            if hasattr(block, "text") and block.text is not None
         )
         return full_response
         
