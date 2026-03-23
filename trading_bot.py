@@ -262,6 +262,45 @@ def get_current_price(ticker):
     print(f"Could not get price for {ticker} from any source")
     return None
 
+def pick_position_to_sell(positions, amount_needed):
+    """
+    Pick the best existing position to sell to raise cash.
+    Prefers positions that:
+    - Cover the amount needed
+    - Have the lowest conviction (smallest value or most negative P&L)
+    Returns the position dict or None.
+    """
+    if not positions:
+        return None
+
+    # Exclude positions already being bought in this cycle
+    candidates = []
+    for pos in positions:
+        value = pos.get("currentPrice", 0) * pos.get("quantity", 0)
+        pnl   = pos.get("ppl", 0)
+        candidates.append({
+            "ticker":   pos.get("ticker"),
+            "value":    value,
+            "pnl":      pnl,
+            "quantity": pos.get("quantity", 0)
+        })
+
+    if not candidates:
+        return None
+
+    # Sort by P&L ascending — sell worst performer first
+    candidates.sort(key=lambda x: x["pnl"])
+
+    # Prefer one that covers the amount needed
+    covering = [c for c in candidates if c["value"] >= amount_needed]
+    if covering:
+        return covering[0]  # worst performer that covers the cost
+
+    # If none cover it fully, return the largest position
+    candidates.sort(key=lambda x: x["value"], reverse=True)
+    return candidates[0]
+
+
 def validate_ticker(ticker):
     """Check ticker exists in T212's instruments list. Return True/False."""
     base_url = f"https://{T212_ENV}.trading212.com/api/v0"
@@ -304,6 +343,73 @@ def execute_trade(ticker, action, amount_gbp):
 
     try:
         if action == "BUY":
+            # Check available cash — sell a position first if needed
+            summary, positions = get_t212_portfolio()
+            if summary:
+                available = summary.get("cash", {}).get("availableToTrade", 0)
+                available = max(0, available - 1)  # £1 buffer
+
+                if available < 1 and not positions:
+                    print(f"Insufficient cash and no positions to sell")
+                    send_whatsapp(
+                        f"⚠️ Trade aborted: no cash and no positions to sell.\n"
+                        f"Top up your T212 account to continue trading."
+                    )
+                    return False
+
+                if amount_gbp > available:
+                    shortfall = amount_gbp - available
+                    print(f"Need £{shortfall:.2f} more — looking for position to sell")
+
+                    sell_pos = pick_position_to_sell(positions, shortfall)
+                    if sell_pos:
+                        sell_ticker   = sell_pos["ticker"]
+                        sell_value    = sell_pos["value"]
+                        sell_quantity = sell_pos["quantity"]
+                        print(f"Auto-selling {sell_ticker} (£{sell_value:.2f}) to fund buy")
+
+                        # Execute the sell first
+                        sell_payload = {
+                            "ticker":   sell_ticker,
+                            "quantity": round(-abs(sell_quantity), 4)
+                        }
+                        sell_resp = requests.post(
+                            f"https://{T212_ENV}.trading212.com/api/v0/equity/orders/market",
+                            headers={**t212_headers(), "Content-Type": "application/json"},
+                            json=sell_payload,
+                            timeout=10
+                        )
+                        print(f"Sell response: {sell_resp.status_code} {sell_resp.text}")
+
+                        if sell_resp.status_code == 200:
+                            send_whatsapp(
+                                f"🔄 Auto-sold {sell_ticker} (£{sell_value:.2f}) "
+                                f"to fund BUY of {ticker}."
+                            )
+                            # Wait for settlement
+                            print("Waiting 5s for sell to settle...")
+                            time.sleep(5)
+                            # Refresh available cash
+                            summary2, _ = get_t212_portfolio()
+                            if summary2:
+                                available = max(
+                                    0,
+                                    summary2.get("cash", {}).get("availableToTrade", 0) - 1
+                                )
+                                amount_gbp = min(amount_gbp, available)
+                        else:
+                            print(f"Sell failed — capping buy to available cash")
+                            amount_gbp = available
+                    else:
+                        print(f"No suitable position to sell — capping to £{available:.2f}")
+                        amount_gbp = available
+
+                if amount_gbp < 1:
+                    send_whatsapp(
+                        f"⚠️ Trade aborted: insufficient funds after attempting to free cash."
+                    )
+                    return False
+
             # T212 only supports orders by QUANTITY, not value
             # So we fetch the current price and calculate shares to buy
             price = get_current_price(ticker)
