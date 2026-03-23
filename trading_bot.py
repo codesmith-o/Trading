@@ -423,16 +423,58 @@ RESPOND IN THIS EXACT FORMAT — keep each line brief:
 IMPORTANT: For STOCK, use the exact Trading 212 ticker format e.g. AAPL_US_EQ, NVDA_US_EQ, TSLA_US_EQ
 """
 
+def get_available_tickers_sample():
+    """Fetch a sample of available T212 tickers to pass to Claude."""
+    base_url = f"https://{T212_ENV}.trading212.com/api/v0"
+    headers  = t212_headers()
+    try:
+        resp = requests.get(
+            f"{base_url}/equity/metadata/instruments",
+            headers=headers, timeout=10
+        )
+        resp.raise_for_status()
+        instruments = resp.json()
+        # Return well-known large cap tickers as examples
+        all_tickers = [inst.get("ticker", "") for inst in instruments]
+        # Filter for US stocks (most commonly recommended)
+        us_tickers = [t for t in all_tickers if t.endswith("_US_EQ")]
+        # Pick a sample of recognisable ones to show Claude the format
+        known = [
+            "AAPL_US_EQ", "NVDA_US_EQ", "TSLA_US_EQ", "MSFT_US_EQ",
+            "AMZN_US_EQ", "GOOGL_US_EQ", "META_US_EQ", "AMD_US_EQ",
+            "NFLX_US_EQ", "PLTR_US_EQ"
+        ]
+        available_known = [t for t in known if t in all_tickers]
+        return all_tickers, available_known
+    except Exception as e:
+        print(f"Instruments fetch error: {e}")
+        return [], []
+
+
 def get_trade_recommendation(portfolio_context):
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     # Include recent trading history so Claude can learn from past calls
     journal_summary = get_journal_summary()
 
+    # Fetch available tickers so Claude only recommends valid ones
+    all_tickers, sample_tickers = get_available_tickers_sample()
+    ticker_count = len(all_tickers)
+    ticker_sample = ", ".join(sample_tickers) if sample_tickers else "unavailable"
+
     user_message = (
         f"{portfolio_context}\n"
         f"Date/Time: {datetime.now().strftime('%d %b %Y, %H:%M')}\n\n"
         f"RECENT TRADING HISTORY (learn from this):\n{journal_summary}\n\n"
+        f"IMPORTANT — AVAILABLE INSTRUMENTS:\n"
+        f"Trading 212 has {ticker_count} instruments available. "
+        f"You MUST only recommend tickers from this platform. "
+        f"Example valid tickers: {ticker_sample}. "
+        f"All US stocks follow the format TICKER_US_EQ. "
+        f"Do NOT recommend stocks like SOFI, RIVN, or others "
+        f"that may not be listed — only recommend well-known large/mid caps "
+        f"that are almost certainly available (AAPL, NVDA, TSLA, MSFT, AMZN, "
+        f"GOOGL, META, AMD, NFLX, PLTR, JPM, BAC, COIN, UBER, ABNB etc).\n\n"
         f"Scan the market now. Find the best opportunity or confirm hold cash. "
         f"Consider past decisions when making this recommendation. "
         f"Keep response under 1100 characters."
