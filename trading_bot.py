@@ -13,6 +13,7 @@ import schedule
 import time
 import base64
 import threading
+import json
 from datetime import datetime
 from anthropic import Anthropic
 from flask import Flask, request
@@ -29,7 +30,7 @@ TWILIO_TO          = os.environ.get("TWILIO_WHATSAPP_TO")
 
 T212_ENV           = os.environ.get("T212_ENV", "live")
 MAX_TRADE_AMOUNT   = 100  # Hard cap £100 per trade
-CANCEL_WINDOW_SECS = 300  # 5 minutes
+CANCEL_WINDOW_SECS = 60  # 1 minute
 
 # ── State ─────────────────────────────────────────────────────────────────────
 # Stores the pending trade while we wait for possible cancellation
@@ -41,6 +42,94 @@ pending_trade = {
     "amount": None,
     "cancelled": False
 }
+
+# ── Trade Journal ──────────────────────────────────────────────────────────────
+
+JOURNAL_FILE = "/app/trade_journal.json"
+
+def load_journal():
+    """Load existing journal or create empty one."""
+    try:
+        with open(JOURNAL_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"trades": [], "checks": []}
+
+def save_journal(journal):
+    """Save journal to disk."""
+    try:
+        with open(JOURNAL_FILE, "w") as f:
+            json.dump(journal, f, indent=2)
+    except Exception as e:
+        print(f"Journal save error: {e}")
+
+def log_check(analysis, action, ticker, amount):
+    """Log every analysis check regardless of whether a trade was made."""
+    journal = load_journal()
+    entry = {
+        "timestamp": datetime.now().isoformat(),
+        "action":    action or "UNKNOWN",
+        "ticker":    ticker or "N/A",
+        "amount":    amount or 0,
+        "analysis":  analysis[:500] if analysis else "No analysis",
+        "outcome":   "PENDING"  # updated later if trade executes
+    }
+    journal["checks"].append(entry)
+    # Keep last 200 checks to avoid file growing too large
+    journal["checks"] = journal["checks"][-200:]
+    save_journal(journal)
+    print(f"Journal: logged check — {action} {ticker}")
+    return len(journal["checks"]) - 1  # return index for later update
+
+def log_trade_outcome(check_index, outcome, exit_price=None, pnl=None):
+    """Update a journal entry with the trade outcome."""
+    journal = load_journal()
+    if 0 <= check_index < len(journal["checks"]):
+        journal["checks"][check_index]["outcome"]     = outcome
+        journal["checks"][check_index]["exit_price"]  = exit_price
+        journal["checks"][check_index]["pnl"]         = pnl
+        journal["checks"][check_index]["updated_at"]  = datetime.now().isoformat()
+        save_journal(journal)
+        print(f"Journal: updated outcome — {outcome}")
+
+def get_journal_summary():
+    """Return a short summary of recent performance for Claude to reference."""
+    journal = load_journal()
+    checks  = journal.get("checks", [])
+
+    if not checks:
+        return "No trading history yet."
+
+    total_checks  = len(checks)
+    trades        = [c for c in checks if c["action"] in ("BUY", "SELL")]
+    executed      = [t for t in trades if t["outcome"] == "EXECUTED"]
+    cancelled     = [t for t in trades if t["outcome"] == "CANCELLED"]
+    failed        = [t for t in trades if t["outcome"] == "FAILED"]
+    holds         = [c for c in checks if c["action"] == "HOLD"]
+
+    # Last 10 checks summary
+    recent = checks[-10:]
+    recent_summary = []
+    for c in recent:
+        ts     = c["timestamp"][:10]
+        action = c["action"]
+        ticker = c.get("ticker", "N/A")
+        result = c.get("outcome", "PENDING")
+        recent_summary.append(f"{ts}: {action} {ticker} → {result}")
+
+    summary = (
+        f"TRADING HISTORY SUMMARY\n"
+        f"Total checks: {total_checks} | "
+        f"Trades attempted: {len(trades)} | "
+        f"Executed: {len(executed)} | "
+        f"Cancelled: {len(cancelled)} | "
+        f"Holds: {len(holds)}\n\n"
+        f"LAST 10 CHECKS:\n" +
+        "\n".join(recent_summary)
+    )
+    return summary
+
+
 
 # ── Flask Web Server (listens for CANCEL replies) ─────────────────────────────
 
@@ -57,6 +146,11 @@ def handle_cancel():
             pending_trade["cancelled"] = True
             pending_trade["active"]    = False
             print("🚫 Trade cancelled via WhatsApp")
+            # Log cancellation in journal
+            log_trade_outcome(
+                pending_trade.get("check_index", -1),
+                "CANCELLED"
+            )
             send_whatsapp("🚫 Trade cancelled. No action taken.")
         else:
             send_whatsapp("No pending trade to cancel.")
@@ -213,12 +307,23 @@ def execute_trade(ticker, action, amount_gbp):
             json=payload,
             timeout=10
         )
+
+        # Log full response before raising so we can see T212's error message
+        print(f"T212 response status: {resp.status_code}")
+        print(f"T212 response body: {resp.text}")
+        print(f"T212 request payload: {payload}")
+
         resp.raise_for_status()
         print(f"✅ Trade executed: {action} {ticker} £{amount_gbp}")
         return True
 
     except requests.RequestException as e:
         print(f"Trade execution error: {e}")
+        # Also try to print response body if available
+        try:
+            print(f"T212 error detail: {e.response.text}")
+        except Exception:
+            pass
         return False
 
 def format_portfolio_context(summary, positions):
@@ -287,10 +392,15 @@ IMPORTANT: For STOCK, use the exact Trading 212 ticker format e.g. AAPL_US_EQ, N
 def get_trade_recommendation(portfolio_context):
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+    # Include recent trading history so Claude can learn from past calls
+    journal_summary = get_journal_summary()
+
     user_message = (
         f"{portfolio_context}\n"
         f"Date/Time: {datetime.now().strftime('%d %b %Y, %H:%M')}\n\n"
+        f"RECENT TRADING HISTORY (learn from this):\n{journal_summary}\n\n"
         f"Scan the market now. Find the best opportunity or confirm hold cash. "
+        f"Consider past decisions when making this recommendation. "
         f"Keep response under 1100 characters."
     )
 
@@ -391,6 +501,9 @@ def run_trading_check():
     action, ticker, amount = parse_recommendation(analysis)
     print(f"Parsed: action={action}, ticker={ticker}, amount={amount}")
 
+    # Log this check to the journal
+    check_index = log_check(analysis, action, ticker, amount)
+
     # 4. If holding cash, just send the analysis
     if action == "HOLD" or not ticker or not amount:
         timestamp = datetime.now().strftime("%d %b, %H:%M")
@@ -461,11 +574,12 @@ def run_trading_check():
 
     # 6. Set pending trade and notify via WhatsApp
     pending_trade = {
-        "active":    True,
-        "ticker":    ticker,
-        "action":    action,
-        "amount":    amount,
-        "cancelled": False
+        "active":      True,
+        "ticker":      ticker,
+        "action":      action,
+        "amount":      amount,
+        "cancelled":   False,
+        "check_index": check_index
     }
 
     timestamp = datetime.now().strftime("%d %b, %H:%M")
@@ -473,14 +587,14 @@ def run_trading_check():
         f"🤖 TRADING BRAIN — {timestamp}\n\n"
         f"{analysis}\n\n"
         f"{funding_line}\n\n"
-        f"⏳ I will {action} £{amount:.0f} of {ticker} in 5 mins.\n"
+        f"⏳ I will {action} £{amount:.0f} of {ticker} in 1 min.\n"
         f"Reply *CANCEL* to stop this trade."
     )
     send_whatsapp(message)
 
     # 6. Wait 5 minutes, checking every 30 seconds for cancellation
     print(f"Waiting 5 mins before executing {action} {ticker}...")
-    for _ in range(10):  # 10 x 30s = 5 mins
+    for _ in range(2):  # 2 x 30s = 1 min
         time.sleep(30)
         if pending_trade["cancelled"]:
             print("Trade was cancelled — skipping execution")
@@ -493,11 +607,13 @@ def run_trading_check():
         success = execute_trade(ticker, action, amount)
 
         if success:
+            log_trade_outcome(check_index, "EXECUTED")
             send_whatsapp(
                 f"✅ Trade executed: {action} £{amount:.0f} of {ticker}.\n"
                 f"Check Trading 212 for confirmation."
             )
         else:
+            log_trade_outcome(check_index, "FAILED")
             send_whatsapp(
                 f"❌ Trade FAILED: {action} {ticker}. "
                 f"Check Railway logs and your T212 account."
