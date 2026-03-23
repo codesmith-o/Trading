@@ -75,23 +75,23 @@ def save_journal(journal):
     except Exception as e:
         print(f"Journal save error: {e}")
 
-def log_check(analysis, action, ticker, amount):
+def log_check(analysis, action, ticker, amount, entry_price=None):
     """Log every analysis check regardless of whether a trade was made."""
     journal = load_journal()
     entry = {
-        "timestamp": datetime.now().isoformat(),
-        "action":    action or "UNKNOWN",
-        "ticker":    ticker or "N/A",
-        "amount":    amount or 0,
-        "analysis":  analysis[:500] if analysis else "No analysis",
-        "outcome":   "PENDING"  # updated later if trade executes
+        "timestamp":   datetime.now().isoformat(),
+        "action":      action or "UNKNOWN",
+        "ticker":      ticker or "N/A",
+        "amount":      amount or 0,
+        "entry_price": entry_price,
+        "analysis":    analysis[:500] if analysis else "No analysis",
+        "outcome":     "PENDING"
     }
     journal["checks"].append(entry)
-    # Keep last 200 checks to avoid file growing too large
     journal["checks"] = journal["checks"][-200:]
     save_journal(journal)
-    print(f"Journal: logged check — {action} {ticker}")
-    return len(journal["checks"]) - 1  # return index for later update
+    print(f"Journal: logged check — {action} {ticker} @ {entry_price}")
+    return len(journal["checks"]) - 1
 
 def log_trade_outcome(check_index, outcome, exit_price=None, pnl=None):
     """Update a journal entry with the trade outcome."""
@@ -104,6 +104,23 @@ def log_trade_outcome(check_index, outcome, exit_price=None, pnl=None):
         save_journal(journal)
         print(f"Journal: updated outcome — {outcome}")
 
+def get_losing_streak():
+    """Count consecutive losing/failed trades most recently."""
+    journal = load_journal()
+    checks  = journal.get("checks", [])
+    executed = [c for c in checks if c["outcome"] == "EXECUTED"]
+    if not executed:
+        return 0
+    streak = 0
+    for trade in reversed(executed):
+        pnl = trade.get("pnl", None)
+        if pnl is not None and pnl < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
 def get_journal_summary():
     """Return a short summary of recent performance for Claude to reference."""
     journal = load_journal()
@@ -112,14 +129,20 @@ def get_journal_summary():
     if not checks:
         return "No trading history yet."
 
-    total_checks  = len(checks)
-    trades        = [c for c in checks if c["action"] in ("BUY", "SELL")]
-    executed      = [t for t in trades if t["outcome"] == "EXECUTED"]
-    cancelled     = [t for t in trades if t["outcome"] == "CANCELLED"]
-    failed        = [t for t in trades if t["outcome"] == "FAILED"]
-    holds         = [c for c in checks if c["action"] == "HOLD"]
+    total_checks = len(checks)
+    trades       = [c for c in checks if c["action"] in ("BUY", "SELL")]
+    executed     = [t for t in trades if t["outcome"] == "EXECUTED"]
+    cancelled    = [t for t in trades if t["outcome"] == "CANCELLED"]
+    holds        = [c for c in checks if c["action"] == "HOLD"]
+    losing_streak = get_losing_streak()
 
-    # Last 10 checks summary
+    # Calculate total realised P&L from journal
+    total_pnl = sum(
+        t.get("pnl", 0) or 0
+        for t in executed
+        if t.get("pnl") is not None
+    )
+
     recent = checks[-10:]
     recent_summary = []
     for c in recent:
@@ -127,15 +150,21 @@ def get_journal_summary():
         action = c["action"]
         ticker = c.get("ticker", "N/A")
         result = c.get("outcome", "PENDING")
-        recent_summary.append(f"{ts}: {action} {ticker} → {result}")
+        price  = c.get("entry_price")
+        price_str = f" @ £{price:.2f}" if price else ""
+        recent_summary.append(f"{ts}: {action} {ticker}{price_str} → {result}")
+
+    defensive = losing_streak >= 3
 
     summary = (
         f"TRADING HISTORY SUMMARY\n"
         f"Total checks: {total_checks} | "
-        f"Trades attempted: {len(trades)} | "
         f"Executed: {len(executed)} | "
         f"Cancelled: {len(cancelled)} | "
-        f"Holds: {len(holds)}\n\n"
+        f"Holds: {len(holds)} | "
+        f"Realised P&L: £{total_pnl:.2f}\n"
+        f"Losing streak: {losing_streak} consecutive losses\n"
+        f"Mode: {'⚠️ DEFENSIVE — 3+ losses in a row, prefer HOLD CASH' if defensive else '✅ NORMAL'}\n\n"
         f"LAST 10 CHECKS:\n" +
         "\n".join(recent_summary)
     )
@@ -532,31 +561,49 @@ def format_portfolio_context(summary, positions):
 # ── Claude API ─────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """
-You are an aggressive trading analyst managing a £100–£500 portfolio on Trading 212.
-Your job is to beat the market. Be concise — entire response must stay under 1100 characters.
+You are an aggressive active trading analyst managing a £100–£500 portfolio on Trading 212.
+Your job is to beat the market through daily active management. Be concise — stay under 1100 characters.
 
-RULES:
+TRADING RULES:
 1. Max £100 on a single trade
-2. Only enter if you can state the catalyst, why NOW, and target exit
-3. Take 50% profit at +15–25%, let rest run
-4. Cut a position if it won't recover to break-even within one week
-5. Never revenge trade
-6. Hold cash is a valid call
+2. CONVICTION THRESHOLD: Only BUY at conviction 8/10 or higher. SELL at 5/10 or lower.
+3. Only enter if you can state: the catalyst, why NOW, and target exit price
+4. Take 50% profit at +15–25%, let rest run if momentum continues
+5. Never revenge trade — no re-entering a stock immediately after a loss
+6. HOLD CASH is valid — never force a trade below 8/10 conviction
+
+ACTIVE SELL RULES — review every existing position every check:
+- Flag any position down more than 8% from entry price → SELL immediately
+- Flag any position held 5+ days with no gain → reassess, likely SELL
+- If market is turning risk-off (indices falling, VIX rising) → consider selling recent buys
+- If a better opportunity exists elsewhere → sell weakest position to fund it
+- Do NOT hold underperformers out of hope — cut them
+
+DEFENSIVE MODE — if 3 or more consecutive losing trades:
+- Switch to HOLD CASH only until market conditions clearly improve
+- Do not buy anything until you see a strong 8+/10 setup
+
+MOMENTUM SCORING — before picking a trade:
+- Score the top 3 opportunities you find on momentum (1-10)
+- Only recommend the highest scorer
+- State why it ranks above the others
 
 RESPOND IN THIS EXACT FORMAT — keep each line brief:
 
-🌍 MARKET: [one sentence]
-🔍 SCAN: [one sentence on opportunity or why nothing]
+🌍 MARKET: [one sentence — risk-on or risk-off today]
+🔍 SCAN: [top opportunity found and why, or why nothing qualifies]
+📊 POSITIONS REVIEW: [one sentence — any existing holdings to sell?]
 ⚡ ACTION: BUY / SELL / HOLD CASH
-📈 STOCK: [Ticker symbol only, e.g. NVDA_US_EQ] (or N/A)
-💰 SIZE: £[amount under £100] (or N/A)
+📈 STOCK: [Ticker_US_EQ format] (or N/A)
+💰 SIZE: £[amount] (or N/A)
 🎯 TARGET: £[price] (or N/A)
-✂️ STOP: [max 10 words]
+✂️ STOP: [plain English, max 10 words]
 🔥 CONVICTION: [X/10]
-📋 PORTFOLIO: [one sentence]
 ⚠️ RISK: [one sentence]
 
-IMPORTANT: For STOCK, use the exact Trading 212 ticker format e.g. AAPL_US_EQ, NVDA_US_EQ, TSLA_US_EQ
+TICKER FORMAT: Always use Trading 212 format e.g. AAPL_US_EQ, NVDA_US_EQ, TSLA_US_EQ, MSFT_US_EQ
+ONLY recommend well-known large/mid cap US stocks: AAPL, NVDA, TSLA, MSFT, AMZN, GOOGL, META,
+AMD, NFLX, PLTR, JPM, BAC, COIN, UBER, ABNB, PYPL, SHOP, SNOW, CRWD, RBLX
 """
 
 def get_available_tickers_sample():
@@ -653,7 +700,7 @@ def parse_recommendation(analysis):
         if line.startswith("📈 STOCK:"):
             val = line.replace("📈 STOCK:", "").strip()
             if val.upper() != "N/A":
-                ticker = val.split()[0]  # take first word only
+                ticker = val.split()[0]
         if line.startswith("💰 SIZE:"):
             val = line.replace("💰 SIZE:", "").strip()
             val = val.replace("£", "").replace(",", "").split()[0]
@@ -661,6 +708,10 @@ def parse_recommendation(analysis):
                 amount = min(float(val), MAX_TRADE_AMOUNT)
             except ValueError:
                 amount = None
+
+    # For SELL actions amount is the full position value — fetch from portfolio
+    if action == "SELL" and ticker and not amount:
+        amount = MAX_TRADE_AMOUNT  # placeholder, execute_trade uses actual quantity
 
     return action, ticker, amount
 
@@ -819,7 +870,14 @@ def run_trading_check():
         success = execute_trade(ticker, action, amount)
 
         if success:
+            # Record entry price in journal for P&L tracking
+            entry_price = get_current_price(ticker)
             log_trade_outcome(check_index, "EXECUTED")
+            # Update entry price on the journal record
+            journal = load_journal()
+            if 0 <= check_index < len(journal["checks"]):
+                journal["checks"][check_index]["entry_price"] = entry_price
+                save_journal(journal)
             send_whatsapp(
                 f"✅ Trade executed: {action} £{amount:.0f} of {ticker}.\n"
                 f"Check Trading 212 for confirmation."
