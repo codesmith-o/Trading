@@ -276,7 +276,7 @@ def execute_trade(ticker, action, amount_gbp):
             if not price or price <= 0:
                 print(f"Could not get price for {ticker}")
                 return False
-            quantity = round(amount_gbp / price, 6)  # fractional shares
+            quantity = round(amount_gbp / price, 4)  # T212 max 4 decimal places
             payload = {
                 "ticker":   ticker,
                 "quantity": quantity
