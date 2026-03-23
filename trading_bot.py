@@ -3,7 +3,7 @@ Trading Brain Bot - Full Live Trading Version
 - Runs 6x daily
 - Fetches live T212 portfolio
 - Calls Claude for analysis
-- Sends WhatsApp with 15 min cancel window
+- Sends WhatsApp with 5 min cancel window
 - Executes trade automatically if not cancelled
 """
 
@@ -29,7 +29,7 @@ TWILIO_TO          = os.environ.get("TWILIO_WHATSAPP_TO")
 
 T212_ENV           = os.environ.get("T212_ENV", "live")
 MAX_TRADE_AMOUNT   = 100  # Hard cap £100 per trade
-CANCEL_WINDOW_SECS = 900  # 15 minutes
+CANCEL_WINDOW_SECS = 300  # 5 minutes
 
 # ── State ─────────────────────────────────────────────────────────────────────
 # Stores the pending trade while we wait for possible cancellation
@@ -416,14 +416,14 @@ def run_trading_check():
         f"🤖 TRADING BRAIN — {timestamp}\n\n"
         f"{analysis}\n\n"
         f"{funding_line}\n\n"
-        f"⏳ I will {action} £{amount:.0f} of {ticker} in 15 mins.\n"
+        f"⏳ I will {action} £{amount:.0f} of {ticker} in 5 mins.\n"
         f"Reply *CANCEL* to stop this trade."
     )
     send_whatsapp(message)
 
-    # 6. Wait 15 minutes, checking every 30 seconds for cancellation
-    print(f"Waiting 15 mins before executing {action} {ticker}...")
-    for _ in range(30):  # 30 x 30s = 15 mins
+    # 6. Wait 5 minutes, checking every 30 seconds for cancellation
+    print(f"Waiting 5 mins before executing {action} {ticker}...")
+    for _ in range(10):  # 10 x 30s = 5 mins
         time.sleep(30)
         if pending_trade["cancelled"]:
             print("Trade was cancelled — skipping execution")
